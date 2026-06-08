@@ -1,15 +1,5 @@
-from __future__ import annotations 
 
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Apr 28 15:54:39 2026
-
-@author: limai
-"""
-
-# -*- coding: utf-8 -*-
-"""
-WaPOR Crop Yield Pipeline
+WaPOR Pipeline
 =========================
 Unified pipeline for downloading and processing WaPOR-3 dekadal rasters
 (AETI and NPP), aggregating them into seasonal totals, and applying
