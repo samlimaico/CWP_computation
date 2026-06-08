@@ -1,0 +1,266 @@
+import geopandas as gpd
+import json
+import rasterio
+import rasterio.mask
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+# ============================================================
+# SETTINGS
+years      = [2019]
+cca_column = 'CommandNam'
+shapefile  = r'C:\Users\limai\Desktop\KU LEUVEN\THESIS\NLBC_Command\6_commands_complete.shp'
+output_csv = r'C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\CCA_statistics_allcrops_qc_{year}.csv'
+
+base_path       = r'C:\Users\limai\Desktop\KU LEUVEN\THESIS\output'
+qc_json_path    = r'C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\qc_thresholds.json'
+
+# Crop display name → folder name used in raster paths
+CROP_FOLDER_MAP = {
+    'Paddy':   'paddy',
+    'Redgram': 'redgram',
+    'Cotton':  'cotton',
+}
+
+# ── Load QC thresholds from JSON written by the pipeline ────────────────────
+# Falls back to None thresholds if the file is missing (no filtering applied).
+def _load_thresholds(json_path: str) -> dict:
+    path = Path(json_path)
+    if not path.exists():
+        print(f"WARNING: qc_thresholds.json not found at {json_path}. "
+              f"No QC filtering will be applied.")
+        return {}
+    with open(path, "r") as f:
+        return json.load(f)
+
+_raw_thresholds = _load_thresholds(qc_json_path)
+
+def get_threshold(crop_folder: str, year: int, variable: str) -> float | None:
+    """Return the QC threshold for a given crop/year/variable, or None if unavailable."""
+    return (
+        _raw_thresholds
+        .get(crop_folder, {})
+        .get(str(year), {})
+        .get(variable)          # 'aeti' or 'yield'
+    )
+
+# Build CROPS dict dynamically from the folder map + loaded thresholds
+CROPS = {
+    display_name: {
+        'folder_name':    folder,
+        # Thresholds are looked up per-year at runtime via get_threshold();
+        # these are kept as None here and resolved inside the main loop.
+        'aeti_threshold':  None,
+        'yield_threshold': None,
+    }
+    for display_name, folder in CROP_FOLDER_MAP.items()
+}
+
+# Variable definitions: name -> (folder_slug, file_prefix)
+VARIABLES = {
+    'CWP (kg/m³)':   ('1_CWP_{crop}_masked',       'CWP'),
+    'AETI (mm)':     ('1_AETI_{crop}_masked',       'AETI'),
+    'Yield (kg/ha)': ('1_CropYield_{crop}_masked',  'Yield'),
+}
+# ============================================================
+
+
+def build_raster_path(base, variable_key, crop_folder, year):
+    folder_template, file_prefix = VARIABLES[variable_key]
+    folder = folder_template.replace('{crop}', crop_folder)
+    return Path(base) / folder / f'{file_prefix}_{year}.tif'
+
+
+def read_masked_array(src, geom):
+    """Return a 1-D float32 array of all pixels inside geom (NaNs stripped)."""
+    masked, _ = rasterio.mask.mask(src, [geom], crop=True, nodata=np.nan)
+    data = masked[0].astype(np.float32)
+    if src.nodata is not None:
+        data[data == src.nodata] = np.nan
+    return data  # still 2-D, NaNs present
+
+
+def pixel_stats(valid_pixels):
+    """Compute summary statistics on a 1-D array of valid (non-NaN) values."""
+    if len(valid_pixels) == 0:
+        return None
+    return {
+        'Mean':     round(float(np.nanmean(valid_pixels)),   3),
+        'Median':   round(float(np.nanmedian(valid_pixels)), 3),
+        'Min':      round(float(np.nanmin(valid_pixels)),    3),
+        'Max':      round(float(np.nanmax(valid_pixels)),    3),
+        'Std':      round(float(np.nanstd(valid_pixels)),    3),
+        'N_pixels': int(len(valid_pixels)),
+    }
+
+
+# Load shapefile once
+gdf = gpd.read_file(shapefile).to_crs(epsg=4326)
+
+all_rows = []
+
+for year in years:
+    print(f"\n{'='*60}")
+    print(f"Processing year: {year}")
+    print(f"{'='*60}")
+
+    for crop_name, crop_cfg in CROPS.items():
+        crop_folder  = crop_cfg['folder_name']
+
+        # Resolve thresholds from JSON for this specific crop + year
+        aeti_thresh  = get_threshold(crop_folder, year, 'aeti')
+        yield_thresh = get_threshold(crop_folder, year, 'yield')
+
+        if aeti_thresh is None or yield_thresh is None:
+            print(f"\n  WARNING: No QC thresholds found for {crop_name} {year} in JSON. "
+                  f"Skipping QC filtering — all valid pixels will be used.")
+
+        print(f"\n  Crop: {crop_name}  |  AETI threshold: {aeti_thresh} mm  |  Yield threshold: {yield_thresh} kg/ha")
+
+        # Build paths for all three variables
+        paths = {v: build_raster_path(base_path, v, crop_folder, year) for v in VARIABLES}
+
+        # Check all files exist before proceeding
+        missing = [str(p) for v, p in paths.items() if not p.exists()]
+        if missing:
+            print(f"    Skipping {crop_name} — missing files:")
+            for m in missing:
+                print(f"      {m}")
+            continue
+
+        # Open all three rasters simultaneously so we can build the QC mask per pixel
+        with rasterio.open(paths['AETI (mm)'])     as src_aeti, \
+             rasterio.open(paths['Yield (kg/ha)']) as src_yield, \
+             rasterio.open(paths['CWP (kg/m³)'])   as src_cwp:
+
+            for _, row in gdf.iterrows():
+                cca_name = row[cca_column]
+                geom     = row['geometry']
+
+                try:
+                    # ---------- read raw 2-D arrays ----------
+                    aeti_2d  = read_masked_array(src_aeti,  geom)
+                    yield_2d = read_masked_array(src_yield, geom)
+                    cwp_2d   = read_masked_array(src_cwp,   geom)
+
+                    # ---------- QC mask ----------
+                    # A pixel is valid only when BOTH AETI and Yield exceed their thresholds
+                    # (and are not NaN). CWP inherits this combined mask.
+                    # If thresholds are None (JSON not found), skip that filter.
+                    aeti_ok  = (aeti_2d  >= aeti_thresh)  if aeti_thresh  is not None else np.ones_like(aeti_2d,  dtype=bool)
+                    yield_ok = (yield_2d >= yield_thresh) if yield_thresh is not None else np.ones_like(yield_2d, dtype=bool)
+                    valid_mask = (~np.isnan(aeti_2d)) & aeti_ok & (~np.isnan(yield_2d)) & yield_ok
+
+                    # ---------- Extract valid pixels ----------
+                    aeti_valid  = aeti_2d[valid_mask]
+                    yield_valid = yield_2d[valid_mask]
+                    cwp_valid   = cwp_2d[valid_mask]
+                    # CWP pixels that survived the AETI+Yield mask but are still NaN
+                    cwp_valid   = cwp_valid[~np.isnan(cwp_valid)]
+
+                    n_raw   = int(np.sum(~np.isnan(aeti_2d)))   # pixels before QC
+                    n_valid = int(len(aeti_valid))               # pixels after QC
+                    n_removed = n_raw - n_valid
+
+                    if n_valid == 0:
+                        print(f"    {cca_name}: no valid pixels after QC — skipping.")
+                        continue
+
+                    print(f"    {cca_name}: {n_raw} raw pixels → {n_valid} valid "
+                          f"({n_removed} removed, "
+                          f"{100*n_removed/n_raw:.1f}%)" if n_raw > 0 else "")
+
+                    # ---------- Store results ----------
+                    for var_name, valid_arr in [
+                        ('AETI (mm)',     aeti_valid),
+                        ('Yield (kg/ha)', yield_valid),
+                        ('CWP (kg/m³)',   cwp_valid),
+                    ]:
+                        stats = pixel_stats(valid_arr)
+                        if stats is None:
+                            continue
+                        all_rows.append({
+                            'Year':     year,
+                            'Crop':     crop_name,
+                            'Variable': var_name,
+                            'CCA':      cca_name,
+                            'N_raw':    n_raw,
+                            'N_valid':  n_valid,
+                            **stats,
+                        })
+
+                except Exception as e:
+                    print(f"    {cca_name}: error — {e}")
+
+# ============================================================
+# Build formatted CSV output (one file per year)
+# ============================================================
+df = pd.DataFrame(all_rows)
+
+COLS = ['CCA', 'Mean', 'Median', 'Min', 'Max', 'Std', 'N_valid', 'N_raw']
+
+for year in years:
+    df_year = df[df['Year'] == year]
+    output_lines = []
+
+    for crop_name in CROPS:
+        df_crop = df_year[df_year['Crop'] == crop_name]
+        if df_crop.empty:
+            continue
+
+        # Crop header
+        output_lines.append(pd.DataFrame(
+            [[f'Crop: {crop_name} | Year: {year}', '', '', '', '', '', '', '']],
+            columns=COLS))
+        output_lines.append(pd.DataFrame([[''] * len(COLS)], columns=COLS))
+
+        for variable in VARIABLES:
+            df_var = df_crop[df_crop['Variable'] == variable].copy()
+            if df_var.empty:
+                continue
+
+            # Variable section header
+            output_lines.append(pd.DataFrame(
+                [[variable, '', '', '', '', '', '', '']],
+                columns=COLS))
+
+            # Column headers
+            output_lines.append(pd.DataFrame([COLS], columns=COLS))
+
+            # Data rows
+            df_var_sorted = df_var.sort_values('CCA')[COLS]
+            output_lines.append(df_var_sorted)
+
+            # Separator
+            output_lines.append(pd.DataFrame([[''] * len(COLS)], columns=COLS))
+
+        output_lines.append(pd.DataFrame([[''] * len(COLS)], columns=COLS))
+
+    final_df = pd.concat(output_lines, ignore_index=True)
+    out_path = output_csv.replace('{year}', str(year))
+    final_df.to_csv(out_path, index=False)
+    print(f"\nStatistics saved to: {out_path}")
+
+# ============================================================
+# Console summary
+# ============================================================
+for year in years:
+    print(f"\n{'='*70}")
+    print(f"YEAR: {year}")
+    print(f"{'='*70}")
+    for crop_name in CROPS:
+        print(f"\n  [{crop_name}]")
+        df_crop = df[(df['Year'] == year) & (df['Crop'] == crop_name)]
+        for variable in VARIABLES:
+            df_var = df_crop[df_crop['Variable'] == variable]
+            if df_var.empty:
+                continue
+            print(f"\n  {variable}")
+            print(f"  {'CCA':<10} {'Mean':>10} {'Median':>10} {'Min':>8} "
+                  f"{'Max':>8} {'Std':>8} {'N_valid':>9} {'N_raw':>7}")
+            print("  " + "-" * 75)
+            for _, r in df_var.sort_values('CCA').iterrows():
+                print(f"  {r['CCA']:<10} {r['Mean']:>10} {r['Median']:>10} "
+                      f"{r['Min']:>8} {r['Max']:>8} {r['Std']:>8} "
+                      f"{r['N_valid']:>9} {r['N_raw']:>7}")
