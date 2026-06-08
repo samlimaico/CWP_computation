@@ -1,0 +1,485 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri May 29 23:36:56 2026
+
+@author: limai
+"""
+
+import numpy as np
+import os
+import rasterio
+import rasterio.mask
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import pandas as pd
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from pathlib import Path
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+
+# ============================================================
+# CONFIG - change only this section
+crop_name  = 'Redgram'
+years      = [2019]  # add more years as they become available
+max_k      = 10      # maximum k to test in elbow method
+output_root = r'C:\Users\limai\Desktop\KU LEUVEN\THESIS\output'
+shapefile   = r'C:\Users\limai\Desktop\KU LEUVEN\THESIS\NLBC_Command\6_commands_complete.shp'
+
+# Input folders
+aeti_folder  = Path(output_root) / f'1_AETI_{crop_name}_masked'
+yield_folder = Path(output_root) / f'1_CropYield_{crop_name}_masked'
+cwp_folder   = Path(output_root) / f'1_CWP_{crop_name}_masked'
+
+
+# Output folders
+cluster_folder = Path(output_root) / f'2_Clusters_{crop_name}'
+elbow_folder   = cluster_folder / 'elbow_plots'
+stats_folder   = cluster_folder / 'statistics'
+cluster_folder.mkdir(parents=True, exist_ok=True)
+elbow_folder.mkdir(parents=True, exist_ok=True)
+stats_folder.mkdir(parents=True, exist_ok=True)
+
+for year in years:
+    print(f'\n{"="*60}')
+    print(f'Processing {year} — {crop_name.upper()}')
+    print(f'{"="*60}')
+
+    # File paths
+    aeti_path  = aeti_folder  / f'AETI_{year}.tif'
+    yield_path = yield_folder / f'Yield_{year}.tif'
+    cwp_path   = cwp_folder   / f'CWP_{year}.tif'
+
+    missing = [p for p in [aeti_path, yield_path, cwp_path] if not p.exists()]
+    if missing:
+        print(f'  Skipping {year}: missing files:')
+        for m in missing:
+            print(f'    {m}')
+        continue
+
+    # ── Load rasters ──────────────────────────────────────────
+    print(f'  Loading rasters...')
+    with rasterio.open(aeti_path) as src:
+        aeti = src.read(1).astype(np.float32)
+        
+        profile = src.profile
+        shape = aeti.shape
+
+    with rasterio.open(yield_path) as src:
+        yld = src.read(1).astype(np.float32)
+
+    with rasterio.open(cwp_path) as src:
+        cwp = src.read(1).astype(np.float32)
+
+    # Remove pixels with unrealistically low values
+    yld[yld   < 100] = np.nan
+    aeti[aeti < 10]  = np.nan
+    cwp[cwp   < 0.1] = np.nan
+
+    # ── Stack and find valid pixels ───────────────────────────
+    stack = np.stack([aeti, yld], axis=-1)  # (rows, cols, 2)
+    flat  = stack.reshape(-1, 2)                  # (pixels, 2)
+
+    valid_mask   = ~np.any(np.isnan(flat), axis=1)
+    valid_pixels = flat[valid_mask]
+
+    print(f'  Valid pixels: {valid_pixels.shape[0]:,} / {flat.shape[0]:,}')
+
+    if valid_pixels.shape[0] < max_k:
+        print(f'  Not enough valid pixels, skipping.')
+        continue
+
+    # ── Standardize ───────────────────────────────────────────
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(valid_pixels)
+
+    # ── Elbow method ──────────────────────────────────────────
+    print(f'  Computing elbow curve (k=1 to {max_k})...')
+    inertias = []
+
+    for k in range(1, max_k + 1):
+        km = KMeans(n_clusters=k, random_state=42, n_init=10)
+        km.fit(scaled)
+        inertias.append(km.inertia_)
+        print(f'    k={k} | inertia={km.inertia_:.2f}')
+
+    # Plot elbow curve
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(range(1, max_k + 1), inertias, 'bo-', linewidth=2, markersize=8)
+    ax.set_xlabel('Number of clusters (k)', fontsize=12)
+    ax.set_ylabel('Inertia (within-cluster sum of squares)', fontsize=12)
+    ax.set_title(f'Elbow Method — {crop_name.upper()} {year}', fontsize=14)
+    ax.grid(True, alpha=0.3)
+    for i, (k, inertia) in enumerate(zip(range(1, max_k + 1), inertias)):
+        ax.annotate(f'{inertia:.0f}', (k, inertia), textcoords='offset points',
+                    xytext=(0, 10), ha='center', fontsize=8)
+    plt.tight_layout()
+    elbow_path = elbow_folder / f'elbow_{crop_name}_{year}.png'
+    plt.savefig(elbow_path, dpi=150, bbox_inches='tight')
+    plt.show()
+    plt.close()
+    print(f'  Elbow plot saved: {elbow_path}')
+
+    # ── Ask user for optimal k ────────────────────────────────
+    while True:
+        try:
+            k = int(input(f'\n  Look at the elbow plot and enter optimal k for {year}: '))
+            if 1 <= k <= max_k:
+                break
+            print(f'  Please enter a number between 1 and {max_k}.')
+        except ValueError:
+            print('  Please enter a valid integer.')
+
+    # ── Run K-Means with chosen k ─────────────────────────────
+    print(f'\n  Running K-Means with k={k}...')
+    km_final = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels   = km_final.fit_predict(scaled)
+    
+    # ── Reconstruct cluster raster ────────────────────────────
+    cluster_map = np.full(flat.shape[0], np.nan, dtype=np.float32)
+    cluster_map[valid_mask] = labels + 1  # clusters start from 1
+    cluster_raster = cluster_map.reshape(shape)
+    
+
+    # ── Cluster statistics ────────────────────────────────────
+    print(f'\n  Cluster statistics for {year} (k={k}):')
+    print(f'  {"Cluster":<10} {"Count":>8} {"AETI mean":>12} {"Yield mean":>12}')
+    print(f'  {"-"*48}')
+
+    stats_rows = []
+    for c in range(k):
+        mask_c    = labels == c
+        vals      = valid_pixels[mask_c]
+
+        # CWP stats per cluster (not used in clustering, just for reporting)
+        cwp_flat  = cwp.flatten()
+        cwp_mask  = cluster_map.reshape(-1) == (c + 1)
+        cwp_valid = cwp_flat[cwp_mask & ~np.isnan(cwp_flat)]
+
+        print(f'  Cluster {c+1:<3} {mask_c.sum():>8,} '
+              f'{vals[:,0].mean():>12.1f} '
+              f'{vals[:,1].mean():>12.1f}')
+        stats_rows.append({
+            'Year':               year,
+            'Cluster':            c + 1,
+            'N_pixels':           int(mask_c.sum()),
+            'AETI_mean (mm)':     round(float(vals[:,0].mean()), 1),
+            'AETI_std':           round(float(vals[:,0].std()),  1),
+            'Yield_mean (kg/ha)': round(float(vals[:,1].mean()), 1),
+            'Yield_std':          round(float(vals[:,1].std()),  1),
+            'CWP_mean (kg/m³)':   round(float(np.nanmean(cwp_valid)), 3) if len(cwp_valid) > 0 else np.nan,
+            'CWP_std':            round(float(np.nanstd(cwp_valid)),  3) if len(cwp_valid) > 0 else np.nan,
+        })
+
+    # Save statistics to CSV
+    stats_df = pd.DataFrame(stats_rows)
+    stats_path = stats_folder / f'ClusterStats_{crop_name}_{year}_k{k}.csv'
+    stats_df.to_csv(stats_path, index=False)
+    print(f'\n  Statistics saved: {stats_path}')
+    
+    # Save cluster raster
+    profile.update(dtype='float32', nodata=np.nan, count=1)
+    out_path = cluster_folder / f'Clusters_{crop_name}_{year}_k{k}.tif'
+    with rasterio.open(out_path, 'w', **profile) as dst:
+        dst.write(cluster_raster, 1)
+    print(f'  Cluster raster saved: {out_path}')
+
+
+print(f'\n{"="*60}')
+print('All done! Outputs saved to:')
+print(f'  Cluster rasters:  {cluster_folder}')
+print(f'  Elbow plots:      {elbow_folder}')
+print(f'  Statistics CSVs:  {stats_folder}')
+
+# ── FOR BETTER VISUALIZATION ─────────────────────────────────────────────
+import matplotlib.patheffects as pe
+
+cluster_path = cluster_folder / f'Clusters_{crop_name}_{year}_k{k}.tif'
+
+# Cluster labels and colors — crop specific
+if crop_name == 'Redgram':
+    cluster_info = {
+        1: {'label': 'Medium', 'color': '#f39c12'},  # orange 
+        2: {'label': 'Low',    'color': '#e74c3c'},  # red    
+        3: {'label': 'High',   'color': '#3498db'},  # blue   
+    }
+    bounds_disc = [0.5, 1.5, 2.5, 3.5]
+else:
+    cluster_info = {
+        1: {'label': 'Medium-High (Water efficient)', 'color': '#2ecc71'},
+        2: {'label': 'Low (Water scarce)',            'color': '#e74c3c'},
+        3: {'label': 'Medium-Low (Below average)',    'color': '#f39c12'},
+        4: {'label': 'High (Well irrigated)',         'color': '#3498db'},
+    }
+    bounds_disc = [0.5, 1.5, 2.5, 3.5, 4.5]
+
+# Load shapefile
+gdf = gpd.read_file(shapefile).to_crs(epsg=4326)
+gdf['centroid'] = gdf.geometry.centroid
+
+# Load rasters clipped to shapefile extent
+def load_clipped(path, gdf):
+    with rasterio.open(path) as src:
+        masked, transform = rasterio.mask.mask(src, gdf.geometry, crop=True, nodata=np.nan)
+        data = masked[0].astype(np.float32)
+        nodata = src.nodata
+        if nodata is not None:
+            data[data == nodata] = np.nan
+        nrows, ncols = data.shape
+        left   = transform.c
+        top    = transform.f
+        right  = left + ncols * transform.a
+        bottom = top  + nrows * transform.e
+        extent = [left, right, bottom, top]
+    return data, extent
+
+print('Loading rasters for visualization...')
+aeti_data,    fixed_extent = load_clipped(aeti_path,    gdf)
+yield_data,   _            = load_clipped(yield_path,   gdf)
+cluster_data, _            = load_clipped(cluster_path, gdf)
+
+# Apply same thresholds
+aeti_data[aeti_data   < 10]  = np.nan
+yield_data[yield_data < 100] = np.nan
+
+# ── Figure 1: 3-panel map (no blank panel) ───────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(18, 7))
+fig.suptitle(f'{crop_name} — {year} Kharif Season', fontsize=16, fontweight='bold')
+
+# Panel 1: AETI
+im1 = axes[0].imshow(aeti_data, cmap='Blues', extent=fixed_extent,
+                      vmin=np.nanpercentile(aeti_data, 2),
+                      vmax=np.nanpercentile(aeti_data, 98))
+axes[0].set_title('AETI (mm)', fontsize=12, fontweight='bold')
+plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+gdf.boundary.plot(ax=axes[0], color='black', linewidth=0.8)
+for _, row in gdf.iterrows():
+    axes[0].text(row['centroid'].x, row['centroid'].y, row['CommandNam'],
+                 fontsize=7, ha='center', va='center', fontweight='bold', color='white',
+                 path_effects=[pe.withStroke(linewidth=2, foreground='black')])
+axes[0].set_xlabel('Longitude', fontsize=9)
+axes[0].set_ylabel('Latitude', fontsize=9)
+
+# Panel 2: Yield
+im2 = axes[1].imshow(yield_data, cmap='YlOrRd', extent=fixed_extent,
+                      vmin=np.nanpercentile(yield_data, 2),
+                      vmax=np.nanpercentile(yield_data, 98))
+axes[1].set_title('Crop Yield (kg/ha)', fontsize=12, fontweight='bold')
+plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+gdf.boundary.plot(ax=axes[1], color='black', linewidth=0.8)
+for _, row in gdf.iterrows():
+    axes[1].text(row['centroid'].x, row['centroid'].y, row['CommandNam'],
+                 fontsize=7, ha='center', va='center', fontweight='bold', color='white',
+                 path_effects=[pe.withStroke(linewidth=2, foreground='black')])
+axes[1].set_xlabel('Longitude', fontsize=9)
+
+# Panel 3: Clusters
+colors_list   = [cluster_info[i]['color'] for i in sorted(cluster_info.keys())]
+cmap_discrete = ListedColormap(colors_list)
+norm_discrete = BoundaryNorm(bounds_disc, cmap_discrete.N)
+
+im3 = axes[2].imshow(cluster_data, cmap=cmap_discrete, norm=norm_discrete,
+                      extent=fixed_extent)
+axes[2].set_title(f'Performance Clusters (k={k})', fontsize=12, fontweight='bold')
+gdf.boundary.plot(ax=axes[2], color='black', linewidth=0.8)
+for _, row in gdf.iterrows():
+    axes[2].text(row['centroid'].x, row['centroid'].y, row['CommandNam'],
+                 fontsize=7, ha='center', va='center', fontweight='bold', color='white',
+                 path_effects=[pe.withStroke(linewidth=2, foreground='black')])
+axes[2].set_xlabel('Longitude', fontsize=9)
+
+# Legend outside the plot
+patches = [mpatches.Patch(color=cluster_info[i]['color'],
+                           label=f'C{i}: {cluster_info[i]["label"]}')
+           for i in sorted(cluster_info.keys())]
+axes[2].legend(handles=patches,
+               bbox_to_anchor=(1.02, 1), loc='upper left',
+               fontsize=8, framealpha=0.9,
+               title='Clusters', title_fontsize=9)
+
+plt.tight_layout()
+fig_path = cluster_folder / f'Figure1_ClusterMaps_{crop_name}_{year}_k{k}.png'
+plt.savefig(fig_path, dpi=200, bbox_inches='tight')
+plt.show()
+plt.close()
+print(f'Figure 1 saved: {fig_path}')
+
+# ── Figure 2: Box plots ───────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+fig.suptitle(f'{crop_name} {year} — Variable Distribution per Cluster',
+             fontsize=14, fontweight='bold')
+
+variables = [
+    (aeti_data,  'AETI (mm)'),
+    (yield_data, 'Yield (kg/ha)'),
+]
+
+for ax, (data, title) in zip(axes, variables):
+    box_data   = []
+    box_labels = []
+    box_colors = []
+
+    for c in sorted(cluster_info.keys()):
+        mask = cluster_data == c
+        vals = data[mask & ~np.isnan(data)]
+        if len(vals) > 0:
+            box_data.append(vals)
+            box_labels.append(f'C{c}\n{cluster_info[c]["label"].split(" ")[0]}')
+            box_colors.append(cluster_info[c]['color'])
+
+    bp = ax.boxplot(box_data, patch_artist=True, labels=box_labels,
+                    showfliers=False, medianprops=dict(color='black', linewidth=2))
+    for patch, color in zip(bp['boxes'], box_colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.8)
+
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_xlabel('Cluster')
+
+plt.tight_layout()
+fig_path = cluster_folder / f'Figure2_BoxPlots_{crop_name}_{year}_k{k}.png'
+plt.savefig(fig_path, dpi=200, bbox_inches='tight')
+plt.show()
+plt.close()
+print(f'Figure 2 saved: {fig_path}')
+
+# ── Figure 3: Scatter plot ────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(9, 7))
+for c in sorted(cluster_info.keys()):
+    mask = (cluster_data == c) & ~np.isnan(aeti_data) & ~np.isnan(yield_data)
+    ax.scatter(aeti_data[mask], yield_data[mask],
+               c=cluster_info[c]['color'],
+               label=f'C{c}: {cluster_info[c]["label"]}',
+               alpha=0.4, s=8)
+ax.set_xlabel('AETI (mm)', fontsize=12)
+ax.set_ylabel('Crop Yield (kg/ha)', fontsize=12)
+ax.set_title(f'AETI vs Crop Yield by Cluster — {crop_name} {year}',
+             fontsize=13, fontweight='bold')
+ax.legend(fontsize=9, framealpha=0.9)
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+fig_path = cluster_folder / f'Figure3_Scatter_{crop_name}_{year}_k{k}.png'
+plt.savefig(fig_path, dpi=200, bbox_inches='tight')
+plt.show()
+plt.close()
+print(f'Figure 3 saved: {fig_path}')
+
+# ── Figure 4: Cluster area bar chart ─────────────────────────────────────
+pixel_area_ha = 300 * 300 / 10000
+fig, ax = plt.subplots(figsize=(8, 6))
+cluster_areas  = []
+cluster_labels = []
+bar_colors     = []
+
+for c in sorted(cluster_info.keys()):
+    n_pixels = int(np.sum(cluster_data == c))
+    area_ha  = n_pixels * pixel_area_ha
+    cluster_areas.append(area_ha)
+    cluster_labels.append(f'C{c}: {cluster_info[c]["label"]}')
+    bar_colors.append(cluster_info[c]['color'])
+
+bars = ax.bar(range(len(cluster_areas)), cluster_areas,
+              color=bar_colors, edgecolor='black', linewidth=0.8, alpha=0.85)
+for bar, area in zip(bars, cluster_areas):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 50,
+            f'{area:,.0f} ha', ha='center', va='bottom', fontsize=10, fontweight='bold')
+ax.set_xticks(range(len(cluster_labels)))
+ax.set_xticklabels(cluster_labels, fontsize=9, rotation=15, ha='right')
+ax.set_ylabel('Area (hectares)', fontsize=12)
+ax.set_title(f'Area per Performance Cluster — {crop_name} {year}', fontsize=13, fontweight='bold')
+ax.grid(True, alpha=0.3, axis='y')
+plt.tight_layout()
+fig_path = cluster_folder / f'Figure4_ClusterArea_{crop_name}_{year}_k{k}.png'
+plt.savefig(fig_path, dpi=200, bbox_inches='tight')
+plt.show()
+plt.close()
+print(f'Figure 4 saved: {fig_path}')
+
+# ── Figure 5: Cluster area % per CCA ─────────────────────────────────────
+print('\nCalculating cluster area % per CCA...')
+cca_area_rows = []
+
+for _, cca_row in gdf.iterrows():
+    cca_name = cca_row['CommandNam']
+    cca_full = cca_row['COMMAND_AR']
+    geom     = [cca_row['geometry']]
+
+    with rasterio.open(cluster_path) as src:
+        try:
+            masked, _ = rasterio.mask.mask(src, geom, crop=True, nodata=np.nan)
+            cca_data  = masked[0].astype(np.float32)
+            cca_data[cca_data == src.nodata] = np.nan
+        except Exception as e:
+            print(f'  Error masking {cca_name}: {e}')
+            continue
+
+    total_valid = np.sum(~np.isnan(cca_data))
+    if total_valid == 0:
+        continue
+
+    for c in range(1, k + 1):
+        n_pixels = int(np.sum(cca_data == c))
+        area_ha  = n_pixels * pixel_area_ha
+        pct      = (n_pixels / total_valid * 100) if total_valid > 0 else 0
+        cca_area_rows.append({
+            'CCA':          cca_name,
+            'CCA_fullname': cca_full,
+            'Cluster':      c,
+            'N_pixels':     n_pixels,
+            'Area_ha':      round(area_ha, 1),
+            'Percentage':   round(pct, 1),
+        })
+
+area_df   = pd.DataFrame(cca_area_rows)
+area_path = cluster_folder / f'ClusterAreaByCCA_{year}_k{k}.csv'
+area_df.to_csv(area_path, index=False)
+print(f'Area statistics saved: {area_path}')
+
+# Stacked bar chart per CCA
+cca_names_sorted = sorted(gdf['CommandNam'].unique())
+fig, ax = plt.subplots(figsize=(12, 7))
+x        = np.arange(len(cca_names_sorted))
+bottom   = np.zeros(len(cca_names_sorted))
+
+for c in range(1, k + 1):
+    values = []
+    for cca in cca_names_sorted:
+        row = area_df[(area_df['CCA'] == cca) & (area_df['Cluster'] == c)]
+        values.append(float(row['Percentage'].values[0]) if len(row) > 0 else 0)
+
+    bars = ax.bar(x, values, 0.6, bottom=bottom,
+                  color=cluster_info[c]['color'],
+                  label=f'C{c}: {cluster_info[c]["label"]}',
+                  edgecolor='white', linewidth=0.5)
+
+    for xi, (val, bot) in enumerate(zip(values, bottom)):
+        if val > 4:
+            cca = cca_names_sorted[xi]
+            row = area_df[(area_df['CCA'] == cca) & (area_df['Cluster'] == c)]
+            area_ha = float(row['Area_ha'].values[0]) if len(row) > 0 else 0
+            ax.text(xi, bot + val/2, f'{area_ha:,.0f} ha',
+                    ha='center', va='center', fontsize=8,
+                    fontweight='bold', color='white')
+    bottom += np.array(values)
+
+full_names = [gdf[gdf['CommandNam'] == cca]['COMMAND_AR'].values[0]
+              for cca in cca_names_sorted]
+ax.set_xticks(x)
+ax.set_xticklabels([f'{cca}\n{full}' for cca, full in zip(cca_names_sorted, full_names)],
+                   fontsize=8, rotation=15, ha='right')
+ax.set_ylabel(f'Percentage of {crop_name} pixels (%)', fontsize=12)
+ax.set_title(f'Cluster Distribution per CCA — {crop_name} {year}',
+             fontsize=13, fontweight='bold')
+ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left', fontsize=9, framealpha=0.9)
+ax.set_ylim(0, 105)
+ax.grid(True, alpha=0.3, axis='y')
+plt.tight_layout()
+fig_path = cluster_folder / f'Figure5_ClusterAreaByCCA_{year}_k{k}.png'
+plt.savefig(fig_path, dpi=200, bbox_inches='tight')
+plt.show()
+plt.close()
+print(f'Figure 5 saved: {fig_path}')
+
+print(f'\n{"="*60}')
+print('All figures saved to:', cluster_folder)
