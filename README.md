@@ -10,5 +10,5 @@ This repository contains the Python scripts used to:
 - Perform K-Means clustering
 - Generate zonal statistics
 
-Author: Gloria
+Author: Gloria Limaico
 Year: 2026
