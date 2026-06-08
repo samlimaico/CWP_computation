@@ -1,0 +1,117 @@
+import fiona
+import geopandas as gpd
+import pandas as pd
+from rasterio.transform import from_bounds
+from rasterio.features import rasterize
+import rasterio
+import numpy as np
+import os
+from shapely.geometry import shape
+
+# ============================================================
+# SETTINGS - change these as needed
+target_crops = {
+    'RICE':      1,
+    'SUGARCANE': 2,
+    'CORN':      3,
+    'GROUNDNUT': 4,
+    'GRAM':      5   # covers Bengal gram, Chickpeas, Pulses
+}
+kharif_months = [6, 7, 8, 9, 10, 11]  # June-November
+years = range(2020, 2026)
+resolution = 0.0001  # ~10m in degrees
+min_confidence = 0.3  # only keep predictions with conf1 >= this
+# ============================================================
+
+filepath = r'C:\Users\limai\Desktop\KU LEUVEN\THESIS\Crop Masks\2_qgis_landscape_monitoring.geojson'
+output_folder = r'C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\CropMasks_new'
+os.makedirs(output_folder, exist_ok=True)
+
+# Load reference raster to match resolution and extent
+ref_raster = r'C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\AETI_seasonal\AETI_2020_season.tif'
+with rasterio.open(ref_raster) as src:
+    ref_transform = src.transform
+    ref_crs = src.crs
+    ref_shape = src.shape
+    ref_bounds = src.bounds
+print(f"Reference raster shape: {ref_shape}")
+print(f"Reference bounds: {ref_bounds}")
+
+# Process year by year to save memory
+for year in years:
+    print(f"\nProcessing {year}...")
+    
+    features_by_crop = {crop: [] for crop in target_crops}
+    count = 0
+
+    with fiona.open(filepath) as src:
+        for feature in src:
+            props = feature['properties']
+            
+            # Filter by year and kharif season
+            start = pd.to_datetime(props['start_date'])
+            if start.year != year or start.month not in kharif_months:
+                continue
+            
+            # Filter by confidence
+            if props['conf1'] < min_confidence:
+                continue
+            
+            # Filter by crop type
+            crop1 = props['crop1'].upper() if props['crop1'] else ''
+            if crop1 not in target_crops:
+                continue
+            
+            # Keep geometry and crop class
+            geom = shape(feature['geometry'])
+            features_by_crop[crop1].append(geom)
+            count += 1
+
+    print(f"  Found {count} matching fields")
+
+    if count == 0:
+        print(f"  No data for {year}, skipping.")
+        continue
+
+    # Rasterize each crop separately and combine into one mask
+    combined_mask = np.zeros(ref_shape, dtype=np.uint8)
+
+    for crop_name, class_val in target_crops.items():
+        geoms = features_by_crop[crop_name]
+        if not geoms:
+            print(f"  No {crop_name} fields found")
+            continue
+
+        print(f"  Rasterizing {crop_name}: {len(geoms)} fields...")
+        burned = rasterize(
+            [(geom, class_val) for geom in geoms],
+            out_shape=ref_shape,
+            transform=ref_transform,
+            fill=0,
+            dtype=np.uint8
+        )
+        # Higher confidence crops overwrite lower (order matters)
+        combined_mask = np.where(burned > 0, burned, combined_mask)
+
+    # Save raster mask
+    out_file = os.path.join(output_folder, f"CropMask_{year}.tif")
+    with rasterio.open(
+        out_file, 'w',
+        driver='GTiff',
+        height=ref_shape[0],
+        width=ref_shape[1],
+        count=1,
+        dtype=np.uint8,
+        crs=ref_crs,
+        transform=ref_transform,
+        nodata=0
+    ) as dst:
+        dst.write(combined_mask, 1)
+
+    unique, counts = np.unique(combined_mask[combined_mask > 0], return_counts=True)
+    print(f"  Saved: {out_file}")
+    for u, c in zip(unique, counts):
+        crop = [k for k, v in target_crops.items() if v == u][0]
+        print(f"    Class {u} ({crop}): {c} pixels")
+
+print("\nAll done!")
