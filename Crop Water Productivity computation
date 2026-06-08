@@ -1,0 +1,686 @@
+from __future__ import annotations 
+
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Apr 28 15:54:39 2026
+
+@author: limai
+"""
+
+# -*- coding: utf-8 -*-
+"""
+WaPOR Crop Yield Pipeline
+=========================
+Unified pipeline for downloading and processing WaPOR-3 dekadal rasters
+(AETI and NPP), aggregating them into seasonal totals, and applying
+per-crop masks to derive final yield estimates.
+
+After masking, automatically computes 1st-percentile QC thresholds for
+AETI and Yield (globally per crop per year) and saves them to
+qc_thresholds.json in the output root. The statistics script reads this
+file directly — no manual threshold entry needed.
+
+Usage
+-----
+1. Edit the Config block at the bottom.
+2. Run:  python wapor_yield_pipeline.py
+
+Crops supported (2019)
+----------------------
+  cotton  | HI=0.45, MC=0.10, class=1
+  paddy   | HI=0.47, MC=0.12, class=2
+  redgram | HI=0.35, MC=0.10, class=3
+"""
+
+
+import calendar
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator
+
+import geopandas as gpd
+import numpy as np
+import rasterio
+import requests
+from osgeo import gdal
+from rasterio.warp import Resampling, reproject
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants / lookup tables
+# ---------------------------------------------------------------------------
+WAPOR_BASE = "https://data.apps.fao.org/gismgr/api/v2/catalog/workspaces/WAPOR-3/mapsets"
+
+CROP_PARAMS: dict[str, dict] = {
+    "cotton":  {"class": 1, "HI": 0.21, "MC": 0.02, "season_months": ["06", "07", "08", "09", "10", "11", "12"]},
+    "paddy":   {"class": 2, "HI": 0.47, "MC": 0.12, "season_months": ["07", "08", "09", "10", "11"]},
+    "redgram": {"class": 3, "HI": 0.19, "MC": 0, "season_months": ["07", "08", "09", "10", "11", "12"]},
+}
+
+MAPSET_META: dict[str, dict] = {
+    "AETI": {"code": "L1-AETI-D", "scale": 0.1,   "unit": "mm"},
+    "NPP":  {"code": "L1-NPP-D",  "scale": 0.001, "unit": "gC/m²/day"},
+}
+
+# ---------------------------------------------------------------------------
+# Configuration dataclass
+# ---------------------------------------------------------------------------
+@dataclass
+class Config:
+    # ── Crop ──────────────────────────────────────────────────────────────
+    crop_name: str = "redgram"
+
+    # ── Years ─────────────────────────────────────────────────────────────
+    years: list[int] = field(default_factory=lambda: list(range(2019, 2026)))
+
+    # ── QC percentile ─────────────────────────────────────────────────────
+    qc_percentile: float = 1.0   # change to 10.0 to test 10th percentile
+
+    # ── Input files ───────────────────────────────────────────────────────
+    shapefile: str = (
+        r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\NLBC_Command\6_commands_complete.shp"
+    )
+    crop_masks: dict[int, str] = field(default_factory=lambda: {
+        2019: r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\CropMasks_new\CropMaps_2019.tif",
+        2020: r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\CropMasks_new\CropMaps_2020.tif",
+        2021: r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\CropMasks_new\CropMaps_2021.tif",
+        2022: r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\CropMasks_new\CropMaps_2022.tif",
+        2023: r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\CropMasks_new\CropMaps_2023.tif",
+        2024: r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\CropMasks_new\CropMaps_2024.tif",
+        2025: r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\CropMasks_new\CropMaps_2025.tif",
+    })
+
+    # ── Output root ───────────────────────────────────────────────────────
+    output_root: str = r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\FINAL RESULTS"
+
+    # ── Behaviour flags ───────────────────────────────────────────────────
+    skip_existing: bool = True
+    products: list[str] = field(default_factory=lambda: ["AETI", "NPP"])
+
+    # ── Derived properties ────────────────────────────────────────────────
+    @property
+    def crop_class(self) -> int:
+        return CROP_PARAMS[self.crop_name]["class"]
+
+    @property
+    def HI(self) -> float:
+        return CROP_PARAMS[self.crop_name]["HI"]
+
+    @property
+    def MC(self) -> float:
+        return CROP_PARAMS[self.crop_name]["MC"]
+
+    @property
+    def season_months(self) -> list[str]:
+        return CROP_PARAMS[self.crop_name]["season_months"]
+
+    def validate(self) -> None:
+        if self.crop_name not in CROP_PARAMS:
+            raise ValueError(
+                f"Unknown crop '{self.crop_name}'. "
+                f"Choose from: {list(CROP_PARAMS)}"
+            )
+        for p in self.products:
+            if p not in MAPSET_META:
+                raise ValueError(f"Unknown product '{p}'. Choose from: {list(MAPSET_META)}")
+
+# ---------------------------------------------------------------------------
+# QC threshold computation
+# ---------------------------------------------------------------------------
+def compute_qc_thresholds(
+    aeti_path: Path,
+    yield_path: Path,
+    crop_name: str,
+    year: int,
+    percentile: float,
+    output_root: Path,
+) -> dict[str, float]:
+    """
+    Compute the Nth-percentile threshold for AETI and Yield globally
+    (all valid pixels in the masked raster). Results are appended to
+    qc_thresholds.json in output_root.
+
+    """
+    thresholds: dict[str, float] = {}
+
+    for label, path in [("aeti", aeti_path), ("yield", yield_path)]:
+        if not path.exists():
+            log.warning("  QC threshold: missing %s — skipping.", path.name)
+            continue
+        with rasterio.open(path) as src:
+            arr = src.read(1).astype(np.float32)
+            nodata = src.nodata
+        if nodata is not None:
+            arr[arr == nodata] = np.nan
+        valid = arr[(~np.isnan(arr)) & (arr > 0)]
+        if len(valid) == 0:
+            log.warning("  QC threshold: no valid pixels in %s.", path.name)
+            continue
+        value = float(np.percentile(valid, percentile))
+        thresholds[label] = round(value, 3)
+        log.info(
+            "  QC | %s | %s | %s | p%.0f = %.3f",
+            crop_name, year, label.upper(), percentile, value,
+        )
+
+    # ── Load existing JSON (if any), update, and save ────────────────────
+    json_path = output_root / "qc_thresholds.json"
+    if json_path.exists():
+        with open(json_path, "r") as f:
+            existing = json.load(f)
+    else:
+        existing = {}
+
+    existing.setdefault(crop_name, {}).setdefault(str(year), {}).update(thresholds)
+
+    with open(json_path, "w") as f:
+        json.dump(existing, f, indent=2)
+
+    log.info("  QC thresholds saved → %s", json_path)
+    return thresholds
+
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
+def iter_rasters(mapset_code: str) -> Iterator[tuple[str, str]]:
+    """Paginate through the WaPOR catalog and yield (code, downloadUrl) pairs."""
+    url: str | None = f"{WAPOR_BASE}/{mapset_code}/rasters"
+    while url:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        body = resp.json()["response"]
+        for item in body["items"]:
+            yield item["code"], item["downloadUrl"]
+        next_links = [lnk["href"] for lnk in body.get("links", []) if lnk["rel"] == "next"]
+        url = next_links[0] if next_links else None
+
+
+def fetch_rasters(mapset_code: str, years: list[int], months: list[str]) -> list[tuple[str, str]]:
+    """Return sorted list of (code, url) filtered to the requested years/months."""
+    log.info("Fetching raster catalog for %s …", mapset_code)
+    wanted = {f"{y}-{m}" for y in years for m in months}
+    results = [
+        (code, url)
+        for code, url in iter_rasters(mapset_code)
+        if any(key in code for key in wanted)
+    ]
+    results.sort()
+    log.info("  → %d dekadal rasters match the filter.", len(results))
+    return results
+
+# ---------------------------------------------------------------------------
+# Dekad helpers
+# ---------------------------------------------------------------------------
+_DEKAD_RE = re.compile(r"(\d{4})-(\d{2})-(D\d)")
+
+def dekad_days(code: str) -> int:
+    """Return the number of calendar days represented by this dekad code."""
+    m = _DEKAD_RE.search(code)
+    if not m:
+        return 10
+    year, month, dekad = int(m.group(1)), int(m.group(2)), m.group(3)
+    return 10 if dekad in ("D1", "D2") else calendar.monthrange(year, month)[1] - 20
+
+# ---------------------------------------------------------------------------
+# Download
+# ---------------------------------------------------------------------------
+def download_rasters(
+    rasters: list[tuple[str, str]],
+    dest_folder: Path,
+    bbox: tuple[float, float, float, float],
+    skip_existing: bool = True,
+) -> None:
+    """Download and clip all rasters via GDAL virtual filesystem."""
+    dest_folder.mkdir(parents=True, exist_ok=True)
+    minx, miny, maxx, maxy = bbox
+
+    for code, url in rasters:
+        out = dest_folder / f"{code}.tif"
+        if skip_existing and out.exists():
+            log.debug("  skip (exists): %s", code)
+            continue
+        log.info("  downloading: %s", code)
+        ds = gdal.Warp(
+            str(out),
+            f"/vsicurl/{url}",
+            outputBounds=(minx, miny, maxx, maxy),
+            outputBoundsSRS="EPSG:4326",
+            dstNodata=-9999,
+        )
+        ds = None  # flush & close
+
+# ---------------------------------------------------------------------------
+# Seasonal aggregation
+# ---------------------------------------------------------------------------
+def aggregate_season(
+    rasters: list[tuple[str, str]],
+    dekadal_folder: Path,
+    seasonal_folder: Path,
+    years: list[int],
+    scale: float,
+    product: str,
+    unit: str,
+) -> dict[int, Path]:
+    """
+    Sum (value × scale × days_in_dekad) over the season for each year.
+    Returns {year: path_to_seasonal_tif}.
+    """
+    seasonal_folder.mkdir(parents=True, exist_ok=True)
+    outputs: dict[int, Path] = {}
+
+    for year in years:
+        year_rasters = [(c, u) for c, u in rasters if str(year) in c]
+        if not year_rasters:
+            log.warning("  no data for year %d – skipped.", year)
+            continue
+
+        seasonal_total: np.ndarray | None = None
+        valid_count:    np.ndarray | None = None
+        profile = None
+
+        for code, _ in year_rasters:
+            filepath = dekadal_folder / f"{code}.tif"
+            if not filepath.exists():
+                log.warning("  missing file: %s – skipped.", filepath.name)
+                continue
+
+            days = dekad_days(code)
+
+            with rasterio.open(filepath) as src:
+                raw = src.read(1).astype(np.float32)
+                nodata = src.nodata if src.nodata is not None else -9999
+                raw[raw == nodata] = np.nan
+
+                if profile is None:
+                    profile = src.profile.copy()
+                    seasonal_total = np.zeros(raw.shape, dtype=np.float32)
+                    valid_count    = np.zeros(raw.shape, dtype=np.float32)
+
+            daily_val  = raw * scale
+            period_val = daily_val * days
+
+            valid = ~np.isnan(period_val)
+            seasonal_total[valid] += period_val[valid]
+            valid_count[valid]    += 1
+
+        if seasonal_total is None:
+            log.warning("  nothing accumulated for %d.", year)
+            continue
+
+        seasonal_total[valid_count == 0] = np.nan
+
+        profile.update(dtype="float32", nodata=np.nan)
+        out_path = seasonal_folder / f"{product}_{year}_season.tif"
+        with rasterio.open(out_path, "w", **profile) as dst:
+            dst.write(seasonal_total, 1)
+
+        log.info(
+            "  %d seasonal %s | min=%.1f  max=%.1f  %s",
+            year, product, np.nanmin(seasonal_total), np.nanmax(seasonal_total), unit,
+        )
+        outputs[year] = out_path
+
+    return outputs
+
+# ---------------------------------------------------------------------------
+# Yield computation (NPP path)
+# ---------------------------------------------------------------------------
+def compute_yield_from_npp(
+    npp_seasonal_paths: dict[int, Path],
+    yield_folder: Path,
+    crop_name: str,
+    HI: float,
+    MC: float,
+) -> dict[int, Path]:
+
+    yield_folder.mkdir(parents=True, exist_ok=True)
+    outputs: dict[int, Path] = {}
+
+    for year, npp_path in npp_seasonal_paths.items():
+        with rasterio.open(npp_path) as src:
+            npp     = src.read(1).astype(np.float32)
+            profile = src.profile.copy()
+
+        biomass    = (npp / 0.45) * 10
+        crop_yield = (biomass * HI) / (1 - MC)
+
+        profile.update(dtype="float32", nodata=np.nan)
+        out_path = yield_folder / f"CropYield_{crop_name}_{year}.tif"
+        with rasterio.open(out_path, "w", **profile) as dst:
+            dst.write(crop_yield, 1)
+
+        outputs[year] = out_path
+
+    return outputs
+
+# ---------------------------------------------------------------------------
+# Crop mask helpers
+# ---------------------------------------------------------------------------
+def load_crop_mask(mask_path: Path) -> tuple[np.ndarray, object, object]:
+    """Return (mask_array, crs, transform) from the crop mask raster."""
+    with rasterio.open(mask_path) as src:
+        arr = src.read(1).astype(np.float32)
+        log.info(
+            "Crop mask | CRS=%s | shape=%s | unique classes=%s",
+            src.crs, arr.shape, np.unique(arr[~np.isnan(arr)]).tolist(),
+        )
+        return arr, src.crs, src.transform
+
+
+def _reproject_mask_to_target(
+    mask_arr: np.ndarray,
+    mask_crs,
+    mask_transform,
+    target_shape: tuple[int, int],
+    target_crs,
+    target_transform,
+) -> np.ndarray:
+    reprojected = np.zeros(target_shape, dtype=np.float32)
+    reproject(
+        source=mask_arr,
+        destination=reprojected,
+        src_transform=mask_transform,
+        src_crs=mask_crs,
+        dst_transform=target_transform,
+        dst_crs=target_crs,
+        resampling=Resampling.nearest,
+    )
+    return reprojected
+
+
+def apply_crop_mask_to_raster(
+    input_raster: Path,
+    output_raster: Path,
+    mask_arr,
+    mask_crs,
+    mask_transform,
+    crop_class: int,
+) -> None:
+    with rasterio.open(input_raster) as src:
+        data           = src.read(1).astype(np.float32)
+        profile        = src.profile.copy()
+        data_crs       = src.crs
+        data_transform = src.transform
+
+    if mask_arr.shape != data.shape or mask_crs != data_crs:
+        reprojected = _reproject_mask_to_target(
+            mask_arr, mask_crs, mask_transform,
+            data.shape, data_crs, data_transform,
+        )
+        final_mask = reprojected == crop_class
+    else:
+        final_mask = mask_arr == crop_class
+
+    masked = np.where(final_mask, data, np.nan)
+    profile.update(dtype="float32", nodata=np.nan)
+
+    with rasterio.open(output_raster, "w", **profile) as dst:
+        dst.write(masked, 1)
+
+    log.info(
+        "    masked pixels=%d | min=%.1f | max=%.1f | mean=%.1f",
+        int(np.sum(final_mask)),
+        np.nanmin(masked), np.nanmax(masked), np.nanmean(masked),
+    )
+
+
+def apply_crop_mask_to_folder(
+    input_folder: Path,
+    output_folder: Path,
+    mask_arr: np.ndarray,
+    mask_crs,
+    mask_transform,
+    crop_class: int,
+    crop_name: str,
+    skip_existing: bool = True,
+) -> None:
+    """Apply the crop mask to every .tif in input_folder."""
+    output_folder.mkdir(parents=True, exist_ok=True)
+    prebuilt_mask = mask_arr == crop_class
+
+    tifs = sorted(input_folder.glob("*.tif"))
+    if not tifs:
+        log.warning("  No .tif files found in %s", input_folder)
+        return
+
+    for tif in tifs:
+        out_path = output_folder / tif.name.replace(".tif", f"_{crop_name}.tif")
+        if skip_existing and out_path.exists():
+            log.debug("  skip (exists): %s", tif.name)
+            continue
+
+        log.info("  masking: %s", tif.name)
+        with rasterio.open(tif) as src:
+            data       = src.read(1).astype(np.float32)
+            data_crs   = src.crs
+            data_tf    = src.transform
+            data_shape = data.shape
+            profile    = src.profile.copy()
+
+        if mask_crs != data_crs or mask_arr.shape != data_shape:
+            log.info("    reprojecting mask to match target raster …")
+            reprojected = _reproject_mask_to_target(
+                mask_arr, mask_crs, mask_transform,
+                data_shape, data_crs, data_tf,
+            )
+            final_mask = reprojected == crop_class
+        else:
+            final_mask = prebuilt_mask
+
+        masked = np.where(final_mask, data, np.nan)
+        profile.update(dtype="float32", nodata=np.nan)
+
+        with rasterio.open(out_path, "w", **profile) as dst:
+            dst.write(masked, 1)
+
+        log.info(
+            "    pixels=%d | min=%.1f | max=%.1f | mean=%.1f",
+            int(final_mask.sum()),
+            np.nanmin(masked), np.nanmax(masked), np.nanmean(masked),
+        )
+
+# ---------------------------------------------------------------------------
+# CWP computation
+# ---------------------------------------------------------------------------
+def compute_cwp(
+    yield_path: Path,
+    aeti_path: Path,
+    output_path: Path,
+) -> None:
+    """Compute Crop Water Productivity = Yield / AETI (kg/m³)."""
+    with rasterio.open(yield_path) as src:
+        crop_yield = src.read(1).astype(np.float32)
+        profile    = src.profile.copy()
+
+    with rasterio.open(aeti_path) as src:
+        aeti = src.read(1).astype(np.float32)
+
+    aeti[aeti == 0] = np.nan
+
+    # CWP (kg/m³): yield(kg/ha) / AETI(mm) * 0.1
+    cwp = (crop_yield / aeti) * 0.1
+
+    profile.update(dtype="float32", nodata=np.nan)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(cwp, 1)
+
+    log.info(
+        "  CWP %s | min=%.2f | max=%.2f | mean=%.2f kg/m³",
+        output_path.name,
+        np.nanmin(cwp), np.nanmax(cwp), np.nanmean(cwp),
+    )
+
+# ---------------------------------------------------------------------------
+# Diagnostic utility
+# ---------------------------------------------------------------------------
+def inspect_raster(path: str | Path) -> None:
+    """Print basic stats for any masked raster — useful for spot-checking."""
+    path = Path(path)
+    if not path.exists():
+        log.error("inspect_raster: file not found — %s", path)
+        return
+    with rasterio.open(path) as src:
+        arr = src.read(1).astype(np.float32)
+        nodata = src.nodata
+    if nodata is not None:
+        arr[arr == nodata] = np.nan
+    valid = arr[(~np.isnan(arr)) & (arr > 0)]
+    print(f"\n── {path.name} ──────────────────────────")
+    print(f"  Total pixels : {arr.size:,}")
+    print(f"  NaN pixels   : {int(np.sum(np.isnan(arr))):,}")
+    print(f"  Zero pixels  : {int(np.sum(arr == 0)):,}")
+    print(f"  Valid pixels : {len(valid):,}")
+    if len(valid):
+        print(f"  Min / Max    : {valid.min():.3f} / {valid.max():.3f}")
+        print(f"  Mean / Std   : {valid.mean():.3f} / {valid.std():.3f}")
+        for p in [1, 5, 10, 25, 50, 75, 90, 95, 99]:
+            print(f"  p{p:<2}          : {np.percentile(valid, p):.3f}")
+    print()
+
+# ---------------------------------------------------------------------------
+# Pipeline entry point
+# ---------------------------------------------------------------------------
+def run(cfg: Config) -> None:
+    cfg.validate()
+
+    log.info(
+        "=== WaPOR Pipeline | crop=%s | class=%d | QC p%.0f ===",
+        cfg.crop_name.upper(), cfg.crop_class, cfg.qc_percentile,
+    )
+
+    gdf  = gpd.read_file(cfg.shapefile).to_crs(epsg=4326)
+    bbox = gdf.total_bounds
+    root = Path(cfg.output_root)
+
+    # Track paths of masked AETI and Yield per year for QC + CWP steps
+    aeti_masked_paths:  dict[int, Path] = {}
+    yield_masked_paths: dict[int, Path] = {}
+
+    for product in cfg.products:
+        meta = MAPSET_META[product]
+
+        dekadal_folder  = root / f"{product}_dekadal"
+        seasonal_folder = root / f"{product}_seasonal"
+
+        rasters = fetch_rasters(meta["code"], cfg.years, cfg.season_months)
+        download_rasters(rasters, dekadal_folder, tuple(bbox), cfg.skip_existing)
+
+        seasonal_paths = aggregate_season(
+            rasters, dekadal_folder, seasonal_folder,
+            cfg.years, meta["scale"], product, meta["unit"],
+        )
+
+        # ── NPP → Yield → mask ──────────────────────────────────────────
+        if product == "NPP":
+            yield_folder = root / f"CropYield_{cfg.crop_name}"
+            yield_paths  = compute_yield_from_npp(
+                seasonal_paths, yield_folder, cfg.crop_name, cfg.HI, cfg.MC
+            )
+
+            masked_folder = root / f"1_CropYield_{cfg.crop_name}_masked"
+            masked_folder.mkdir(parents=True, exist_ok=True)
+
+            for year, yield_path in yield_paths.items():
+                mask_val = cfg.crop_masks.get(year)
+                if not mask_val or not Path(mask_val).is_file():
+                    log.warning("Skipping Yield mask for %d: mask file not found.", year)
+                    continue
+
+                mask_arr, mask_crs, mask_transform = load_crop_mask(Path(mask_val))
+                out_path = masked_folder / f"Yield_{year}.tif"
+                apply_crop_mask_to_raster(
+                    yield_path, out_path, mask_arr, mask_crs, mask_transform, cfg.crop_class
+                )
+                yield_masked_paths[year] = out_path
+
+        # ── AETI seasonal → mask ────────────────────────────────────────
+        if product == "AETI":
+            masked_folder = root / f"1_AETI_{cfg.crop_name}_masked"
+            masked_folder.mkdir(parents=True, exist_ok=True)
+
+            for year, aet_path in seasonal_paths.items():
+                mask_val = cfg.crop_masks.get(year)
+                if not mask_val or not Path(mask_val).is_file():
+                    log.warning("Skipping AETI mask for %d: mask file not found.", year)
+                    continue
+
+                mask_arr, mask_crs, mask_transform = load_crop_mask(Path(mask_val))
+                out_path = masked_folder / f"AETI_{year}.tif"
+                apply_crop_mask_to_raster(
+                    aet_path, out_path, mask_arr, mask_crs, mask_transform, cfg.crop_class
+                )
+                aeti_masked_paths[year] = out_path
+
+    # ── QC thresholds ───────────────────────────────────────────────────
+    log.info("=== Computing QC thresholds (p%.0f) ===", cfg.qc_percentile)
+    for year in cfg.years:
+        aeti_path  = aeti_masked_paths.get(year)
+        yield_path = yield_masked_paths.get(year)
+        if aeti_path is None or yield_path is None:
+            log.warning("  Skipping QC thresholds for %d: masked files not available.", year)
+            continue
+        compute_qc_thresholds(
+            aeti_path, yield_path,
+            cfg.crop_name, year,
+            cfg.qc_percentile,
+            root,
+        )
+
+    # ── CWP ─────────────────────────────────────────────────────────────
+    log.info("=== Computing Crop Water Productivity ===")
+    cwp_folder = root / f"1_CWP_{cfg.crop_name}_masked"
+    cwp_folder.mkdir(parents=True, exist_ok=True)
+
+    aeti_masked_folder  = root / f"1_AETI_{cfg.crop_name}_masked"
+    yield_masked_folder = root / f"1_CropYield_{cfg.crop_name}_masked"
+
+    for year in cfg.years:
+        yield_path = yield_masked_folder / f"Yield_{year}.tif"
+        aeti_path  = aeti_masked_folder  / f"AETI_{year}.tif"
+        cwp_path   = cwp_folder          / f"CWP_{year}.tif"
+
+        if not yield_path.exists() or not aeti_path.exists():
+            log.warning("  Skipping CWP for %d: missing Yield or AETI file.", year)
+            continue
+
+        if cwp_path.exists() and cfg.skip_existing:
+            log.debug("  skip (exists): CWP_%d.tif", year)
+            continue
+
+        compute_cwp(yield_path, aeti_path, cwp_path)
+
+    log.info("=== DONE ===")
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    config = Config(
+        crop_name     = "redgram",
+        years         = list(range(2019, 2026)),
+        qc_percentile = 2.0,   # switch to 10.0 to test 10th percentile
+        shapefile     = r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\NLBC_Command\6_commands_complete.shp",
+        crop_masks    = {
+            2019: r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\output\CropMasks_new\CropMaps_2019.tif",
+            # Add other years here when available
+        },
+        output_root   = r"C:\Users\limai\Desktop\KU LEUVEN\THESIS\output",
+        products      = ["AETI", "NPP"],
+        skip_existing = True,
+    )
+    run(config)
